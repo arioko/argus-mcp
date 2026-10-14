@@ -11,6 +11,7 @@ Public API
 - :func:`build_chain` — Compose a list of middleware into a single handler
 - :class:`RecoveryMiddleware` — Exception safety net
 - :class:`AuditMiddleware` — Basic audit logging
+- :class:`OptimizerMiddleware` — Resolves optimizer meta-tools locally
 - :class:`RoutingMiddleware` — Routes requests to backend sessions
 """
 
@@ -21,6 +22,7 @@ from argus_mcp.bridge.middleware.chain import (
     RequestContext,
     build_chain,
 )
+from argus_mcp.bridge.middleware.optimizer import OptimizerMiddleware
 from argus_mcp.bridge.middleware.recovery import RecoveryMiddleware
 from argus_mcp.bridge.middleware.routing import RoutingMiddleware
 
@@ -28,6 +30,7 @@ __all__ = [
     "AuditMiddleware",
     "MCPHandler",
     "MCPMiddleware",
+    "OptimizerMiddleware",
     "RecoveryMiddleware",
     "RequestContext",
     "RoutingMiddleware",
