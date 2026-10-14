@@ -202,6 +202,26 @@ class TestAuditMiddleware:
         result = await mw(ctx, handler)
         assert result == "ok"
 
+    @pytest.mark.asyncio
+    async def test_exception_emits_error_event_and_reraises(self):
+        """An exception from downstream is audited as an error outcome
+        before propagating to outer middleware (e.g. recovery)."""
+        from argus_mcp.bridge.middleware.audit import AuditMiddleware
+
+        mock_logger = MagicMock()
+        handler = AsyncMock(side_effect=ValueError("downstream boom"))
+        mw = AuditMiddleware(audit_logger=mock_logger)
+        ctx = RequestContext(capability_name="find_tool", mcp_method="call_tool")
+
+        with pytest.raises(ValueError, match="downstream boom"):
+            await mw(ctx, handler)
+
+        mock_logger.emit.assert_called_once()
+        event = mock_logger.emit.call_args[0][0]
+        assert event.outcome.status == "error"
+        assert event.outcome.error_type == "ValueError"
+        assert "downstream boom" in event.outcome.error
+
 
 # AuthMiddleware
 

@@ -260,11 +260,9 @@ async def _build_middleware_stack(
     middlewares.append(AuditMiddleware(audit_logger=audit_logger))
 
     # Resolve optimizer meta-tools (find_tool) locally, just before routing.
-    # The index is attached after the chain is built, so resolve it lazily
-    # per request via the server state.
-    middlewares.append(
-        OptimizerMiddleware(lambda: get_state(mcp_server).optimizer_index)
-    )
+    # The index is attached after the chain is built, so resolve the state
+    # lazily per request.
+    middlewares.append(OptimizerMiddleware(lambda: get_state(mcp_server)))
 
     routing = RoutingMiddleware(service.registry, service.manager)
     chain = build_chain(middlewares=middlewares, handler=routing)

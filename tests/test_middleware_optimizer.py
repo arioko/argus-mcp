@@ -2,9 +2,10 @@
 
 Covers:
 - find_tool interception: returns CallToolResult built from optimizer.search()
-- Pass-through: non-meta capabilities and non-call_tool methods reach next_handler
-- Missing optimizer index → BackendServerError
-- ``limit`` argument parsing (valid, invalid, default)
+- Composite workflow tools merged into find_tool results
+- Pass-through: non-meta capabilities, non-call_tool methods, and
+  disabled/missing optimizer index all reach next_handler
+- ``limit`` argument parsing (valid, invalid, negative, default)
 - End-to-end chain: find_tool resolves before RoutingMiddleware even when
   the capability registry cannot resolve it (SEC-02 regression test)
 """
@@ -12,6 +13,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any, Optional
 from unittest.mock import AsyncMock, MagicMock
 
@@ -24,7 +26,6 @@ from argus_mcp.bridge.middleware.optimizer import OptimizerMiddleware
 from argus_mcp.bridge.middleware.routing import RoutingMiddleware
 from argus_mcp.bridge.optimizer.meta_tools import FIND_TOOL_NAME
 from argus_mcp.constants import OPTIMIZER_SEARCH_LIMIT
-from argus_mcp.errors import BackendServerError
 
 
 def _make_optimizer(results: Optional[list] = None) -> MagicMock:
@@ -35,6 +36,16 @@ def _make_optimizer(results: Optional[list] = None) -> MagicMock:
         else [{"name": "sql_run", "description": "Run SQL", "score": 0.9}]
     )
     return optimizer
+
+
+def _state(
+    optimizer: Optional[MagicMock] = None,
+    composites: Optional[list] = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        optimizer_index=optimizer,
+        composite_tools=composites or [],
+    )
 
 
 def _ctx(
@@ -52,7 +63,7 @@ def _ctx(
 class TestFindToolInterception:
     async def test_find_tool_returns_search_results(self) -> None:
         optimizer = _make_optimizer()
-        mw = OptimizerMiddleware(lambda: optimizer)
+        mw = OptimizerMiddleware(lambda: _state(optimizer))
         next_handler = AsyncMock()
 
         result = await mw(_ctx(arguments={"query": "sql"}), next_handler)
@@ -66,7 +77,7 @@ class TestFindToolInterception:
 
     async def test_find_tool_forwards_limit(self) -> None:
         optimizer = _make_optimizer()
-        mw = OptimizerMiddleware(lambda: optimizer)
+        mw = OptimizerMiddleware(lambda: _state(optimizer))
 
         await mw(_ctx(arguments={"query": "sql", "limit": 10}), AsyncMock())
 
@@ -74,7 +85,7 @@ class TestFindToolInterception:
 
     async def test_find_tool_invalid_limit_uses_default(self) -> None:
         optimizer = _make_optimizer()
-        mw = OptimizerMiddleware(lambda: optimizer)
+        mw = OptimizerMiddleware(lambda: _state(optimizer))
 
         await mw(
             _ctx(arguments={"query": "sql", "limit": "not-a-number"}),
@@ -83,25 +94,64 @@ class TestFindToolInterception:
 
         optimizer.search.assert_called_once_with("sql", OPTIMIZER_SEARCH_LIMIT)
 
+    async def test_find_tool_negative_limit_uses_default(self) -> None:
+        optimizer = _make_optimizer()
+        mw = OptimizerMiddleware(lambda: _state(optimizer))
+
+        await mw(_ctx(arguments={"query": "sql", "limit": -1}), AsyncMock())
+
+        optimizer.search.assert_called_once_with("sql", OPTIMIZER_SEARCH_LIMIT)
+
     async def test_find_tool_missing_arguments_defaults(self) -> None:
         optimizer = _make_optimizer(results=[])
-        mw = OptimizerMiddleware(lambda: optimizer)
+        mw = OptimizerMiddleware(lambda: _state(optimizer))
 
         result = await mw(_ctx(arguments=None), AsyncMock())
 
         optimizer.search.assert_called_once_with("", OPTIMIZER_SEARCH_LIMIT)
         assert json.loads(result.content[0].text) == []
 
-    async def test_find_tool_missing_index_raises(self) -> None:
-        mw = OptimizerMiddleware(lambda: None)
 
-        with pytest.raises(BackendServerError, match="not available"):
-            await mw(_ctx(arguments={"query": "sql"}), AsyncMock())
+class TestCompositeTools:
+    async def test_composites_included_in_results(self) -> None:
+        optimizer = _make_optimizer(results=[])
+        composite = MagicMock()
+        composite.to_tool_info = MagicMock(
+            return_value={
+                "name": "deploy_workflow",
+                "description": "Deploys the database migration workflow",
+                "inputSchema": {"type": "object"},
+            }
+        )
+        mw = OptimizerMiddleware(
+            lambda: _state(optimizer, composites=[composite])
+        )
+
+        result = await mw(_ctx(arguments={"query": "database"}), AsyncMock())
+
+        payload = json.loads(result.content[0].text)
+        assert payload[0]["name"] == "deploy_workflow"
+        assert payload[0]["backend"] == "composite"
+
+    async def test_composites_not_matching_excluded(self) -> None:
+        optimizer = _make_optimizer()
+        composite = MagicMock()
+        composite.to_tool_info = MagicMock(
+            return_value={"name": "unrelated", "description": "other"}
+        )
+        mw = OptimizerMiddleware(
+            lambda: _state(optimizer, composites=[composite])
+        )
+
+        result = await mw(_ctx(arguments={"query": "sql"}), AsyncMock())
+
+        payload = json.loads(result.content[0].text)
+        assert all(r["name"] != "unrelated" for r in payload)
 
 
 class TestPassThrough:
     async def test_other_capability_forwarded(self) -> None:
-        mw = OptimizerMiddleware(lambda: _make_optimizer())
+        mw = OptimizerMiddleware(lambda: _state(_make_optimizer()))
         next_handler = AsyncMock(return_value="backend_result")
 
         result = await mw(_ctx(capability_name="jira_search"), next_handler)
@@ -111,14 +161,31 @@ class TestPassThrough:
 
     async def test_find_tool_non_call_tool_method_forwarded(self) -> None:
         """Only call_tool requests for find_tool are intercepted."""
-        mw = OptimizerMiddleware(lambda: _make_optimizer())
+        mw = OptimizerMiddleware(lambda: _state(_make_optimizer()))
         next_handler = AsyncMock(return_value="forwarded")
 
-        result = await mw(
-            _ctx(mcp_method="read_resource"), next_handler
-        )
+        result = await mw(_ctx(mcp_method="read_resource"), next_handler)
 
         assert result == "forwarded"
+        next_handler.assert_awaited_once()
+
+    async def test_find_tool_forwarded_when_optimizer_disabled(self) -> None:
+        """With no index, a backend-provided find_tool stays reachable."""
+        mw = OptimizerMiddleware(lambda: _state(optimizer=None))
+        next_handler = AsyncMock(return_value="backend_find_tool")
+
+        result = await mw(_ctx(arguments={"query": "sql"}), next_handler)
+
+        assert result == "backend_find_tool"
+        next_handler.assert_awaited_once()
+
+    async def test_find_tool_forwarded_when_state_missing(self) -> None:
+        mw = OptimizerMiddleware(lambda: None)
+        next_handler = AsyncMock(return_value="backend_find_tool")
+
+        result = await mw(_ctx(arguments={"query": "sql"}), next_handler)
+
+        assert result == "backend_find_tool"
         next_handler.assert_awaited_once()
 
 
@@ -131,12 +198,13 @@ class TestChainIntegration:
         optimizer layer the call dies in RoutingMiddleware with
         "Capability 'find_tool' does not exist".
         """
+        optimizer = _make_optimizer()
         registry = MagicMock()
         registry.resolve_capability = MagicMock(return_value=None)
         manager = MagicMock()
 
         chain = build_chain(
-            middlewares=[OptimizerMiddleware(lambda: _make_optimizer())],
+            middlewares=[OptimizerMiddleware(lambda: _state(optimizer))],
             handler=RoutingMiddleware(registry, manager),
         )
 
@@ -144,6 +212,11 @@ class TestChainIntegration:
 
         assert isinstance(result, CallToolResult)
         assert result.isError is False
+        payload = json.loads(result.content[0].text)
+        assert payload[0]["name"] == "sql_run"
+        optimizer.search.assert_called_once_with(
+            "oracle", OPTIMIZER_SEARCH_LIMIT
+        )
         registry.resolve_capability.assert_not_called()
 
     async def test_unknown_capability_still_fails_in_routing(self) -> None:
@@ -153,7 +226,7 @@ class TestChainIntegration:
         manager = MagicMock()
 
         chain = build_chain(
-            middlewares=[OptimizerMiddleware(lambda: _make_optimizer())],
+            middlewares=[OptimizerMiddleware(lambda: _state(_make_optimizer()))],
             handler=RoutingMiddleware(registry, manager),
         )
 

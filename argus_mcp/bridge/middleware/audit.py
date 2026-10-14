@@ -40,7 +40,42 @@ class AuditMiddleware:
             list((ctx.arguments or {}).keys()),
         )
 
-        result = await next_handler(ctx)
+        try:
+            result = await next_handler(ctx)
+        except Exception as exc:
+            logger.info(
+                "AUDIT RESPONSE id=%s method=%s capability=%s backend=%s outcome=error elapsed_ms=%.1f error=%s",
+                ctx.request_id,
+                ctx.mcp_method,
+                ctx.capability_name,
+                ctx.server_name or "unknown",
+                ctx.elapsed_ms,
+                exc,
+            )
+            if self._audit_logger is not None:
+                event = AuditEvent(
+                    event_id=ctx.request_id,
+                    event_type="mcp_operation",
+                    source=AuditSource(
+                        session_id=ctx.metadata.get("session_id"),
+                        client_ip=ctx.metadata.get("client_ip"),
+                        user_id=ctx.metadata.get("user_subject"),
+                    ),
+                    target=AuditTarget(
+                        backend=ctx.server_name,
+                        method=ctx.mcp_method,
+                        capability_name=ctx.capability_name,
+                        original_name=ctx.original_name,
+                    ),
+                    outcome=AuditOutcome(
+                        status="error",
+                        latency_ms=round(ctx.elapsed_ms, 2),
+                        error=str(exc),
+                        error_type=type(exc).__name__,
+                    ),
+                )
+                self._audit_logger.emit(event)
+            raise
 
         outcome_status = "error" if ctx.error else "success"
         logger.info(
